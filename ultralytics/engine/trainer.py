@@ -388,6 +388,10 @@ class BaseTrainer:
                 # Backward
                 self.scaler.scale(self.loss).backward()
 
+                # # 剪枝BN稀疏化训练
+                # if self.args.sparse:
+                #     BatchNormSparser.updateBN(self.model, self.args.sparse_rate, ignore_idx)
+
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
                     self.optimizer_step()

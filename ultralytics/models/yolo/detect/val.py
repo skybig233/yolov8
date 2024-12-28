@@ -332,6 +332,9 @@ class DetectionValidator(BaseValidator):
                 stats[self.metrics.keys[-1]], stats[self.metrics.keys[-2]] = (
                     val.stats[:2] if self.is_coco else [val.results["AP50"], val.results["AP"]]
                 )
+                if self.is_coco:
+                    self.metrics.coco=eval.stats
+                    # stats["coco"]=eval.stats
             except Exception as e:
                 LOGGER.warning(f"{pkg} unable to run: {e}")
         return stats
