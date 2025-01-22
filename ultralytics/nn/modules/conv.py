@@ -36,7 +36,7 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 
 class Conv(nn.Module):
     """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
-
+    # 
     default_act = nn.SiLU()  # default activation
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
@@ -53,7 +53,49 @@ class Conv(nn.Module):
     def forward_fuse(self, x):
         """Apply convolution and activation without batch normalization."""
         return self.act(self.conv(x))
+    
+class MSQConv(nn.Module):
+    """MSQuantConv with migscale parameter."""
 
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, migscale=1.0):
+        """Initialize MSQuantConv layer with migscale and other arguments."""
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        self.migscale = migscale.view(1,-1,1,1)
+
+    def forward(self, x):
+        """Apply migscale to input and weight, then perform convolution, batch normalization, and activation."""
+        x = x / self.migscale
+        return self.act(self.bn(self.conv(x)))
+
+    def forward_fuse(self, x):
+        """Perform fused forward operation with migscale."""
+        x = x / self.migscale
+        return self.act(self.conv(x))
+    
+# class MSQConv(nn.Module):
+#     """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
+
+#     def __init__(self, conv,smooth_scales):
+#         """Initialize Conv layer with given arguments including activation."""
+#         super().__init__()
+#         assert isinstance(conv.conv,nn.Conv2d)
+#         self.cv=conv
+#         self.mig_scale = smooth_scales
+#         self.cv.conv.weight *= self.mig_scale.view(1,-1,1,1).to(self.cv.conv.weight.device)
+
+#     def forward(self, x):
+#         """Apply convolution, batch normalization and activation to input tensor."""
+#         return self.cv(x/self.mig_scale)
+
+#     def forward_fuse(self, x):
+#         """Perform transposed convolution of 2D data."""
+#         return self.cv(x/self.mig_scale)
+    
 
 class Conv2(Conv):
     """Simplified RepConv module with Conv fusing."""

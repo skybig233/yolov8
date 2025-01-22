@@ -4,8 +4,44 @@
 import torch
 
 from pytorch_quantization.calib.histogram import HistogramCalibrator
-@torch.no_grad()
 
+from myquant.ppqfunc import compute_mse_loss, convert_any_to_numpy
+
+
+
+
+
+@torch.no_grad()
+def minmax_to_scale_offset(min_val: float, max_val: float,n_bits=8,min_scale=1e-8,sym=True):
+    if not sym:
+        range = float(max_val - min_val)
+        quant_max=2 ** n_bits - 1
+        quant_min=0
+        scale  = range / (quant_max - quant_min)
+        if scale < min_scale:
+            print('Numeric instability detected: '
+                        f'ppq find there is a scale value < {min_scale}, '
+                        'which probably cause numeric underflow in further computation.')
+        scale = max(scale, min_scale)
+        offset = round(-min_val / scale)
+    else:
+        range = 2 * float(max(abs(max_val), abs(min_val)))
+        quant_max=2 ** (n_bits - 1) - 1
+        quant_min=-2 ** (n_bits - 1)
+        scale  = range / (quant_max - quant_min)
+        if scale < min_scale:
+            print('Numeric instability detected: '
+                        f'ppq find there is a scale value < {min_scale}, '
+                        'which probably cause numeric underflow in further computation.')
+        scale = max(scale, min_scale)
+        offset = 0
+    return scale,offset 
+
+@torch.no_grad()
+def identity(x,n_bits=32):
+    return x
+
+@torch.no_grad()
 def quantize_weight_per_channel_absmax(w, n_bits=8,dim=0):
     # w: (out_features, in_features, kernel_size, kernel_size)
     dim=(0,2,3) if dim==1 else (1,2,3)
@@ -52,10 +88,45 @@ def quantize_activation_per_tensor_percentile(a, n_bits=8):
         scales = torch.quantile(a.abs().view(-1)[:16777216*n].view(n, 16777216), 0.9999,1).mean()
     else:
         scales = torch.quantile(a.abs(), 0.9999)
-    q_max = 2 ** (n_bits - 1) - 1
-    scales.clamp_(min=1e-5).div_(q_max)
-    a.div_(scales).round_().clamp_(min=-q_max-1,max=q_max).mul_(scales)
+    # q_max = 2 ** (n_bits - 1) - 1
+    q_max = 2 ** n_bits - 1
+    q_min = 0 
+    # scales.clamp_(min=1e-5).div_(q_max)
+    scales.clamp_(min=1e-5).div_(q_max - q_min)
+    # zero_point = q_max - (a.max()/scales).round()
+    zero_point=(-a.min()/scales).round()
+    a.div_(scales).add_(zero_point).round_().sub_(zero_point).mul_(scales)
+    # a.div_(scales).round_().clamp_(min=-q_max-1,max=q_max).mul_(scales)
     return a
+
+# def hist_observer(value,n_bits):
+#     _min=value.abs().max()
+#     hist_bins=2048
+#     hist=torch.zeros(size=(hist_bins,), dtype=torch.int32, device=value.device)
+#     hist = torch.histc(value, hist_bins, min=self._min, max=self._max)
+#     hist += hist.int()
+# jzs
+# @torch.no_grad()
+# def quantize_activation_per_tensor_percentile(a, n_bits=8):
+#     numel = a.numel()
+#     percentile=0.9999
+#     percentile_collector=[]
+#     min_idx, max_idx = int(numel * (1 - percentile)), int(numel * (percentile))
+#     # torch.kthvalue needs index from 1 to numel ...
+#     min_idx = max(0, min_idx) + 1
+#     max_idx = min(max_idx, numel - 1) + 1
+#     _min = torch.kthvalue(a.flatten(), k = min_idx, dim=0)[0].view(1, -1)
+#     _max = torch.kthvalue(a.flatten(), k = max_idx, dim=0)[0].view(1, -1)
+#     percentile_collector.append(torch.cat([_max, _min], dim=-1))
+#     device = percentile_collector[-1].device
+#     percentile_collector = torch.cat(percentile_collector, dim=0).float().mean(dim=0)
+#     scale, offset = minmax_to_scale_offset(
+#         min_val = percentile_collector[1].item(),
+#         max_val = percentile_collector[0].item(),
+#         n_bits=n_bits,
+#         sym=False)
+#     a.div_(scale).add_(offset).round_().sub_(offset).mul_(scale)
+#     return a
 
 @torch.no_grad()
 def quantize_activation_per_channel_minmax_asym(a, n_bits=8,dim=1):
@@ -68,8 +139,7 @@ def quantize_activation_per_channel_minmax_asym(a, n_bits=8,dim=1):
     zero_point = ((-a.min(dim=dim, keepdim=True)[0])/scales).round()
     # print(zero_point.shape)
 
-    # a.div_(scales).round_().add_(zero_point).sub_(zero_point).mul_(scales)
-    a.div_(scales).add_(zero_point).round_().sub_(zero_point).mul_(scales)
+    a.div_(scales).round_().add_(zero_point).sub_(zero_point).mul_(scales)
     return a
 
 @torch.no_grad()
@@ -81,9 +151,56 @@ def quantize_activation_per_tensor_minmax_asym(a, n_bits=8):
     scales.clamp_(min=1e-5).div_(q_max - q_min)
     # zero_point = q_max - (a.max()/scales).round()
     zero_point=(-a.min()/scales).round()
-    a.div_(scales).add_(zero_point).round_().sub_(zero_point).mul_(scales)
+
+    a.div_(scales).round_().add_(zero_point).sub_(zero_point).mul_(scales)
     return a
 
+
+def collect_hist(a,sym=False,hist_bins=2048):
+    # hist_bins=2048
+    hist=torch.zeros(size=(hist_bins,), dtype=torch.int32, device=a.device)
+    hist_range=a.max()-a.min()
+    hist_scale=hist_range / hist_bins
+    if sym:
+        hist = torch.histc(torch.abs(a), hist_bins, min=0, max=hist_scale * hist_bins)
+        hist += hist.int()
+    else:
+        hist = torch.histc(a, hist_bins, min=a.min(), max=a.max())
+        hist += hist.int()
+    return hist
+
+def per_tensor_qyolo(a, n_bits=8, num_bins=2048):
+    hist_bins=num_bins
+    hist_range=a.max()-a.min()
+    hist_scale=hist_range / hist_bins
+    hist=collect_hist(a,hist_bins=hist_bins)
+    histogram = convert_any_to_numpy(hist).tolist()
+    num_of_quant_levels = 2**n_bits
+    losses = []
+    # at least we can have a min-max result
+    step = hist_bins // num_of_quant_levels + 1
+    loss = compute_mse_loss(histogram=histogram, start=0, step=step, end=num_of_quant_levels * step)
+    losses.append({'mse': loss, 'start': 0, 'end': num_of_quant_levels * step})
+
+    for end in range(128,hist_bins):
+        step=round(end/num_of_quant_levels)+1
+        start=0
+        loss = compute_mse_loss(histogram=histogram, start=start, step=step, end=end)
+        losses.append({'mse': loss, 'start': start, 'end': end})
+
+    best_policy = sorted(losses, key=lambda x: x['mse'])[0]
+    best_start  = best_policy['start']
+    best_end    = best_policy['end']
+
+    # translate start & end to scale & offset.
+    range_min, range_max = (best_start * hist_scale) + a.min(), (best_end * hist_scale) + a.min()
+    range_min=range_min.item()
+    range_max=range_max.item()
+    if range_min<=-0.2 and range_min>=-0.3:
+        range_min=-0.2785
+    scale, offset = minmax_to_scale_offset(range_min, range_max,sym=False)
+    a.div_(scale).add_(offset).round_().sub_(offset).mul_(scale)
+    return a
 
 @torch.no_grad()
 def quantize_activation_kl(a, n_bits=8, num_bins=2048):

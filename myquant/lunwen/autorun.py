@@ -1,14 +1,14 @@
 import os
 code="/home/jzs/cv/ultralytics/myquant/lunwen/val_lunwen.py"
 
-# weights=[
-#     "/home/jzs/cv/ultralytics/runs/detect/voc_yolov8n/weights/best.pt",
-#     "/home/jzs/cv/ultralytics/runs/detect/voc_yolov8s/weights/best.pt"
-# ]
 weights=[
-    "yolov8n-obb.pt",
-    "yolov8s-obb.pt"
+    "/home/jzs/cv/ultralytics/runs/detect/voc_yolov8n/weights/best.pt",
+    "/home/jzs/cv/ultralytics/runs/detect/voc_yolov8s/weights/best.pt"
 ]
+# weights=[
+#     "yolov8n-obb.pt",
+#     "yolov8s-obb.pt"
+# ]
 q=[
     ("per_tensor","per_tensor_percentile"),
     ("per_tensor","per_tensor_asym")

@@ -1,9 +1,10 @@
 import os
 import numpy as np
 import torch
-from ultralytics import YOLO
+# from ultralytics import YOLO
+import ultralytics
 
-def load_calib_dataset(calib_path,batchsize,imgsz):
+def load_calib_dataset(calib_path,batchsize,imgsz,calib_size=32):
     import torchvision.transforms as transforms
     from PIL import Image
     # create dataloader
@@ -19,6 +20,8 @@ def load_calib_dataset(calib_path,batchsize,imgsz):
         img = Image.open(path).convert('RGB')
         img = trans(img)
         imgs.append(img) # img is 0 - 1
+        if len(imgs)>calib_size:
+            break
 
     from torch.utils.data import DataLoader
     dataloader = DataLoader(dataset=imgs, batch_size=batchsize)
@@ -39,7 +42,7 @@ def load_yolov5_model(model_path):
 
 
 def load_yolov8_model(model_path):
-    return YOLO(model_path).model
+    return ultralytics.YOLO(model_path).model
 
 
 def load_model(model_path:str):
@@ -67,6 +70,22 @@ def val_model(onnx_path,save_metrics_txt,cfg,imgsz):
         val_yolov8_model(onnx_path,save_metrics_txt,cfg,imgsz)
     else:
         raise Exception
+
+
+# awq_utils
+def get_op_name(module, op):
+    # get the name of the op relative to the module
+    for name, m in module.named_modules():
+        if m is op:
+            return name
+    raise ValueError(f"Cannot find op {op} in module {module}")
+
+def get_op_by_name(module, op_name):
+    # get the op by its name relative to the module
+    for name, m in module.named_modules():
+        if name == op_name:
+            return m
+    raise ValueError(f"Cannot find op {op_name} in module {module}")
 
 
 if __name__=="__main__":

@@ -1,4 +1,5 @@
 import itertools
+import json
 import os
 import time
 from matplotlib import pyplot as plt
@@ -7,6 +8,9 @@ import torch
 from torch import nn
 from functools import partial
 
+import yaml
+
+from myquant.utils.yolo_utils import get_op_name
 from myquant.measure.cosine import torch_cosine_similarity
 from myquant.measure.updater import CosineUpdater, EQCosineUpdater, MSEUpdater
 from myquant.quantizer import *
@@ -121,7 +125,7 @@ class AWQObserver(nn.Module):
         return f"AWQObserver({self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}, bias={self.bias is not None})"
 
 
-class W4A16AWQConv2d(nn.Module):
+class SmoothConv2d(nn.Module):
     def __init__(
         self,
         in_channels, 
@@ -180,7 +184,7 @@ class W4A16AWQConv2d(nn.Module):
         self.output_quant=None
 
     def to(self, *args, **kwargs):
-        super(W4A16AWQConv2d, self).to(*args, **kwargs)
+        super(SmoothConv2d, self).to(*args, **kwargs)
         self.weight = self.weight.to(*args, **kwargs)
         if self.bias is not None:
             self.bias = self.bias.to(*args, **kwargs)
@@ -197,10 +201,12 @@ class W4A16AWQConv2d(nn.Module):
 
     @staticmethod
     def from_float(
-        module, weight_quant="per_channel", act_quant="per_channel", quantize_output=False,w_num_of_bit=8,a_num_of_bit=8
+        root,module, 
+        weight_quant="", act_quant="", quantize_output=False,w_num_of_bit=8,a_num_of_bit=8,
+        apply_scale="",save_scale={}
     ):
         assert isinstance(module, AWQObserver)
-        new_module = W4A16AWQConv2d(
+        new_module = SmoothConv2d(
             module.in_channels,
             module.out_channels,
             module.kernel_size,
@@ -215,8 +221,20 @@ class W4A16AWQConv2d(nn.Module):
             a_num_of_bit=a_num_of_bit
         )
         
-        
-        if act_quant == "per_channel":
+        # 根据量化参数字符串对应量化函数
+        if weight_quant == "no_quant" or w_num_of_bit==32:
+            w_quant_method = partial(identity,n_bits=w_num_of_bit)
+        elif weight_quant == "per_channel":
+            w_quant_method = partial(quantize_weight_per_channel_absmax, n_bits=w_num_of_bit,dim=1)
+        elif weight_quant == "per_tensor":
+            w_quant_method = partial(quantize_weight_per_tensor_absmax, n_bits=w_num_of_bit)
+
+        else:
+            raise ValueError(f"Invalid weight_quant: {weight_quant}")
+
+        if act_quant == "no_quant" or a_num_of_bit==32:
+            act_quant_method = partial(identity,n_bit=a_num_of_bit)
+        elif act_quant == "per_channel":
             act_quant_method = partial(quantize_activation_per_channel_absmax, n_bits=a_num_of_bit,dim=1)
         elif act_quant == "per_channel_asym":
             act_quant_method = partial(quantize_activation_per_channel_minmax_asym, n_bits=a_num_of_bit,dim=1)
@@ -226,6 +244,9 @@ class W4A16AWQConv2d(nn.Module):
             act_quant_method = partial(quantize_activation_per_tensor_percentile, n_bits=a_num_of_bit)
         elif act_quant == "per_tensor_asym":
             act_quant_method = partial(quantize_activation_per_tensor_minmax_asym, n_bits=a_num_of_bit)
+        elif act_quant == "per_tensor_qyolo":
+            act_quant_method = partial(per_tensor_qyolo, n_bits=a_num_of_bit)
+
         else:
             raise ValueError(f"Invalid act_quant: {act_quant}")
         
@@ -237,7 +258,8 @@ class W4A16AWQConv2d(nn.Module):
             new_module.output_quant = new_module.act_quant
         else:
             new_module.output_quant_name = "None"
-            new_module.output_quant = lambda x: x
+            new_module.output_quant = identity
+
 
         weight_scales = module.weight.abs().amax(dim=(0,2,3))
         # awq方案
@@ -263,36 +285,40 @@ class W4A16AWQConv2d(nn.Module):
         # best_f_value = f(s)
         in_channels=module.weight.shape[1]
         # 创建 0.1 到 0.9 之间的 9 个值
-        s1_part1 = np.arange(0.02, 1, 0.02)
-        # 创建 1 到 10 之间的 10 个值
+        # s1_part1 = np.arange(0.02, 1, 0.02)
+        # # 创建 1 到 10 之间的 10 个值
         s1_part2 = np.arange(1, 10, 0.2)
-        # 合并两个部分
-        # s1_range = np.concatenate((s1_part1, s1_part2))
+        # # 合并两个部分
+        # # s1_range = np.concatenate((s1_part1, s1_part2))
         # s1_range = s1_part1
         s1_range = s1_part2
-        # s1_range=np.arange(0.1, 10.0, 0.5)
-        # 全channodeel搜索
-        # s1_combinations = list(itertools.product(s1_range, repeat=in_channels))
-        # 只搜索前两个channel
-        s1_combinations=[tuple(list(i)+[1 for i in range(in_channels-2)]) for i in itertools.product(s1_range, repeat=2)]
+        # # s1_range=np.arange(0.1, 10.0, 0.5)
+        # # 全channodeel搜索
+        # # s1_combinations = list(itertools.product(s1_range, repeat=in_channels))
+        # # 只搜索前两个channel
+        # s1_combinations=[tuple(list(i)+[1 for i in range(in_channels-2)]) for i in itertools.product(s1_range, repeat=2)]
         # updater=MSEUpdater()
         # updater=EQCosineUpdater()
 
         # 顺序搜索，贪心算法，优化完第一个再优化第二个
+        # weight_scales = module.weight.abs().amax(dim=(0,2,3))
+        # best_scales = x_max**0.5 / weight_scales**0.5
         # search_order=[i for i in range(in_channels)]
+        # alpha=0.5
+        # beta=2
+        # n=20
+        # print(f"迁移尺度初始化{best_scales}")
         # # search_order=[i for i in range(in_channels-1,-1,-1)]
-        # best_scales=[1 for i in range(in_channels)]
+        # # best_scales=[1 for i in range(in_channels)]
         # for channel in search_order:
-        #     for scale in s1_range:
-        #         tmp_scale=best_scales.copy()
+        #     scale_search_space=np.linspace(alpha*best_scales[channel].item(),beta*best_scales[channel].item(),n)
+        #     for scale in scale_search_space:
+        #         tmp_scale=best_scales.clone()
         #         tmp_scale[channel]=scale
         #         scales=torch.tensor(tmp_scale,dtype=torch.float32).to(module.weight.device)
         #         new_weight=module.weight.clone()
         #         new_weight=new_weight.mul_(scales.view(1,-1,1,1).to(module.weight.device)) # w · s
-        #         if weight_quant == "per_channel":
-        #             new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) # Q(w*s)
-        #         elif weight_quant == "per_tensor":
-        #             new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) # Q(w*s)
+        #         new_weight.data = w_quant_method(new_weight.data)
         #         updater=MSEUpdater()
         #         for i in range(len(module.inputs)):
         #             org_out = torch.functional.F.conv2d(module.inputs[i], module.weight, module.bias, module.stride, module.padding, module.dilation, module.groups)
@@ -306,6 +332,7 @@ class W4A16AWQConv2d(nn.Module):
         #         if is_best:
         #             best_error = loss
         #             best_scales[channel] = tmp_scale[channel]
+        #     print(f"channel {channel}完成搜索，目前最优{best_scales}")
         # best_scales=torch.tensor(best_scales,dtype=torch.float32).to(module.weight.device)
 
 
@@ -341,10 +368,7 @@ class W4A16AWQConv2d(nn.Module):
                     scales=torch.tensor(tmp_scale,dtype=torch.float32).to(module.weight.device)
                     new_weight=module.weight.clone()
                     new_weight=new_weight.mul_(scales.view(1,-1,1,1).to(module.weight.device)) # w · s
-                    if weight_quant == "per_channel":
-                        new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) # Q(w*s)
-                    elif weight_quant == "per_tensor":
-                        new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) # Q(w*s)
+                    new_weight.data = w_quant_method(new_weight.data) # Q(w*s)
                     updater=MSEUpdater()
                     for i in range(len(module.inputs)):
                         org_out = torch.functional.F.conv2d(module.inputs[i], module.weight, module.bias, module.stride, module.padding, module.dilation, module.groups)
@@ -372,22 +396,23 @@ class W4A16AWQConv2d(nn.Module):
         
         best_scales=torch.tensor(best_scales,dtype=torch.float32).to(module.weight.device)
 
-        # # awq
-        # # # 全局搜索
-        # # for scales in s1_combinations:
-        # #     scales = torch.tensor(scales,dtype=torch.float32).to(module.weight.device)
+        # awq
+        # 全局搜索
+        # for scales in s1_combinations:
+        #     scales = torch.tensor(scales,dtype=torch.float32).to(module.weight.device)
         # for ratio in range(n_grid):
         #     ratio = ratio * 1 / n_grid
         #     scales = x_max.pow(ratio).clamp(min=1e-4).view(-1)
         #     scales = scales / (scales.max() * scales.min()).sqrt()
         #     new_weight=module.weight.clone()
         #     new_weight=new_weight.mul_(scales.view(1,-1,1,1).to(module.weight.device)) # w · s
-        #     if weight_quant == "per_channel":
-        #         # new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) / (scales.view(1, -1,1,1)) # Q(w*s)/s
-        #         new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) # Q(w*s)
-        #     elif weight_quant == "per_tensor":
-        #         # new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) / (scales.view(1, -1,1,1)) # Q(w*s)/s
-        #         new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) # Q(w*s)
+        #     # if weight_quant == "per_channel":
+        #     #     # new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) / (scales.view(1, -1,1,1)) # Q(w*s)/s
+        #     #     new_weight.data = quantize_weight_per_channel_absmax(new_weight.data,n_bits=w_num_of_bit,dim=1) # Q(w*s)
+        #     # elif weight_quant == "per_tensor":
+        #     #     # new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) / (scales.view(1, -1,1,1)) # Q(w*s)/s
+        #     #     new_weight.data = quantize_weight_per_tensor_absmax(new_weight.data,n_bits=w_num_of_bit) # Q(w*s)
+        #     new_weight.data=w_quant_method(new_weight.data) # Q(w*s)
         #     updater=MSEUpdater()
         #     # q_i=quantize_activation_per_channel_absmax(torch.concat(module.inputs)/)
         #     for i in range(len(module.inputs)):
@@ -452,25 +477,24 @@ class W4A16AWQConv2d(nn.Module):
         # best_scales = x_max**0.5 / weight_scales**0.5
         new_module.smooth_scales=best_scales
         print(f"best_SCALES:{best_scales}")
+        
+        # 更新save_scale
+        
+        name=get_op_name(root,module)
+        save_scale[name]=best_scales.tolist()
+
         module.weight.data = module.weight.data*best_scales.view(1,-1,1,1) #w*s
-        if weight_quant == "per_channel":
-            new_module.weight = quantize_weight_per_channel_absmax(
-                module.weight, n_bits=w_num_of_bit,dim=1
-            )
-        elif weight_quant == "per_tensor":
-            new_module.weight = quantize_weight_per_tensor_absmax(
-                module.weight, n_bits=w_num_of_bit
-            )
-        else:
-            raise ValueError(f"Invalid weight_quant: {weight_quant}")
+        new_module.weight=w_quant_method(module.weight)
         new_module.weight_quant_name = weight_quant
+
         if module.bias is not None:
             new_module.bias = module.bias
         torch.cuda.empty_cache()
+        
         return new_module
     
     def __repr__(self):
-        return f"W8A8SmoothConv2d({self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}, bias={self.bias is not None}, weight_quant={self.weight_quant_name}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
+        return f"SmoothConv2d({self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}, bias={self.bias is not None}, weight_quant={self.weight_quant_name}, act_quant={self.act_quant_name}, output_quant={self.output_quant_name})"
 
 
 
@@ -490,15 +514,14 @@ def awq_calib_model(
 
 # 再进行这步，在 val 中对 activation 和 weight 进行 smooth 后再量化
 def awq_quantize_model(
-    model, weight_quant="per_tensor", act_quant="per_tensor"
+    root,model, weight_quant="per_tensor", act_quant="per_tensor",apply_scale={},save_scale={}
 ):
     for name, module in model.named_children():
         if isinstance(module, AWQObserver):
-            # print("yes")
-            module = W4A16AWQConv2d.from_float(
-                module, weight_quant=weight_quant, act_quant=act_quant
+            module = SmoothConv2d.from_float(
+                root,module, weight_quant=weight_quant, act_quant=act_quant,apply_scale=apply_scale,save_scale=save_scale
             )
             setattr(model, name, module)
         else:
-            awq_quantize_model(module, weight_quant=weight_quant,act_quant=act_quant)
+            awq_quantize_model(root,module, weight_quant=weight_quant,act_quant=act_quant,apply_scale=apply_scale,save_scale=save_scale)
     return model

@@ -1,12 +1,17 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import inspect
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
 import numpy as np
 import torch
 from PIL import Image
+
+from myquant.lunwen.drawfig import hook_fn
+import myquant.lunwen.lunwen
+# from myquant.lunwen.lunwen import AWQObserver, awq_calib_model
 
 from ultralytics.cfg import TASK2DATA, get_cfg, get_save_dir
 from ultralytics.engine.results import Results
@@ -555,6 +560,22 @@ class Model(nn.Module):
                 self.predictor.save_dir = get_save_dir(self.predictor.args)
         if prompts and hasattr(self.predictor, "set_prompts"):  # for SAM-type models
             self.predictor.set_prompts(prompts)
+
+        if any([isinstance(module,myquant.lunwen.lunwen.AWQObserver) for name,module in self.model.named_modules()]): # for MSQ quant
+            self.predictor.model=myquant.lunwen.lunwen.awq_calib_model(self.predictor.model)
+            # 创建fig目录
+            beforemsq_data_dir = 'before_migration_data'
+            aftermsq_data_dir="after_migration_data"
+            if not os.path.exists(beforemsq_data_dir):
+                os.makedirs(beforemsq_data_dir)
+            if not os.path.exists(aftermsq_data_dir):
+                os.makedirs(aftermsq_data_dir)
+            # Calib Model
+            # # 迁移前查看数据分布，注册钩子到每一个卷积层
+            for name, layer in self.predictor.model.named_modules():
+                if isinstance(layer, myquant.lunwen.lunwen.AWQObserver):
+                    layer.register_forward_hook(lambda module, input, output, name=name: hook_fn(module, input, output, name,beforemsq_data_dir))
+
         return self.predictor.predict_cli(source=source) if is_cli else self.predictor(source=source, stream=stream)
 
     def track(
